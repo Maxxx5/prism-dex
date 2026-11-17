@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   createPublicClient,
   createWalletClient,
@@ -144,6 +144,9 @@ function PrismLogo() {
 export default function App() {
   const [account, setAccount] = useState<Address | null>(null);
   const [chainId, setChainId] = useState<number | null>(null);
+  const [showWalletMenu, setShowWalletMenu] = useState<boolean>(false);
+  const [copiedAddr, setCopiedAddr] = useState<boolean>(false);
+  const walletMenuRef = useRef<HTMLDivElement | null>(null);
 
   const [tokens, setTokens] = useState<TokenInfo[]>(DEFAULT_TOKENS);
   const [balances, setBalances] = useState<Record<string, bigint>>({});
@@ -184,7 +187,20 @@ export default function App() {
     []
   );
 
-  // Load recent swaps from the tAMM pool
+  // Close wallet dropdown when clicking outside
+  useEffect(() => {
+    function handleOutsideClick(e: MouseEvent) {
+      if (
+        walletMenuRef.current &&
+        !walletMenuRef.current.contains(e.target as Node)
+      ) {
+        setShowWalletMenu(false);
+      }
+    }
+    document.addEventListener('mousedown', handleOutsideClick);
+    return () => document.removeEventListener('mousedown', handleOutsideClick);
+  }, []);
+
   const loadRecentSwaps = useCallback(async () => {
     setIsLoadingFeed(true);
     try {
@@ -266,19 +282,29 @@ export default function App() {
 
   useEffect(() => {
     if (!window.ethereum) return;
-    window.ethereum
-      .request({ method: 'eth_accounts' })
-      .then((accs: Address[]) => {
-        if (accs?.[0]) {
-          setAccount(accs[0]);
-          window.ethereum.request({ method: 'eth_chainId' }).then((hex: string) => {
-            setChainId(parseInt(hex, 16));
-          });
-        }
-      })
-      .catch(() => {});
+    if (localStorage.getItem('prism_wallet_disconnected') !== '1') {
+      window.ethereum
+        .request({ method: 'eth_accounts' })
+        .then((accs: Address[]) => {
+          if (accs?.[0]) {
+            setAccount(accs[0]);
+            window.ethereum.request({ method: 'eth_chainId' }).then((hex: string) => {
+              setChainId(parseInt(hex, 16));
+            });
+          }
+        })
+        .catch(() => {});
+    }
 
-    const onAccounts = (accs: Address[]) => setAccount(accs?.[0] ?? null);
+    const onAccounts = (accs: Address[]) => {
+      if (accs?.[0]) {
+        localStorage.removeItem('prism_wallet_disconnected');
+        setAccount(accs[0]);
+      } else {
+        setAccount(null);
+        setShowWalletMenu(false);
+      }
+    };
     const onChain = (hex: string) => setChainId(parseInt(hex, 16));
 
     window.ethereum.on?.('accountsChanged', onAccounts);
@@ -399,7 +425,6 @@ export default function App() {
     };
   }, [publicClient]);
 
-  // Quote simulation helper with virtual ETH balance override so quotes work for all visitors
   const simulateNativeBuyQuote = useCallback(
     async (ethAmountRaw: bigint, deadline: bigint) => {
       const simAccount = account ?? QUOTE_SIM_ACCOUNT;
@@ -422,7 +447,6 @@ export default function App() {
         });
         return BigInt((sim.result as any) ?? 0n);
       } catch {
-        // Fallback without stateOverride if RPC restricts overrides
         const sim = await publicClient.simulateContract({
           address: AMMORA_V3_NATIVE_ROUTER,
           abi: ammoraV3NativeRouterAbi,
@@ -437,7 +461,6 @@ export default function App() {
     [account, publicClient]
   );
 
-  // Auto-quote for any pair (ETH, WETH, tAMM, custom ERC-20)
   useEffect(() => {
     let cancelled = false;
     const numericIn = Number(amountIn);
@@ -466,7 +489,6 @@ export default function App() {
     const inIsTamm = isSameAddr(tokenIn.address, TAMM_ADDRESS);
     const outIsTamm = isSameAddr(tokenOut.address, TAMM_ADDRESS);
 
-    // 1. ETH <-> WETH (1:1)
     if ((inIsEth && outIsWeth) || (inIsWeth && outIsEth)) {
       const raw = parseUnits(amountIn, 18);
       setLastQuote({ mode: 'weth', expectedOut: raw, minOut: raw });
@@ -487,7 +509,6 @@ export default function App() {
         const recipient = account ?? QUOTE_SIM_ACCOUNT;
         const deadline = BigInt(Math.floor(Date.now() / 1000) + 1800);
 
-        // 2. Buy tAMM (with ETH or WETH)
         if ((inIsEth || inIsWeth) && outIsTamm) {
           const expectedOut = await simulateNativeBuyQuote(amountInRaw, deadline);
           const minOut =
@@ -522,7 +543,6 @@ export default function App() {
           return;
         }
 
-        // 3. Sell tAMM (for ETH or WETH)
         if (inIsTamm && (outIsEth || outIsWeth)) {
           let expectedOut = 0n;
           const userTammBal = account ? balances[TAMM_ADDRESS.toLowerCase()] ?? 0n : 0n;
@@ -594,7 +614,6 @@ export default function App() {
           return;
         }
 
-        // 4. Other tokens via AmmoraRouteClient
         const head = await publicClient.getBlockNumber();
         const routes = await AmmoraRouteClient.create({
           client: publicClient as any,
@@ -672,6 +691,7 @@ export default function App() {
     }
     try {
       setErrorMsg(null);
+      localStorage.removeItem('prism_wallet_disconnected');
       const accounts: Address[] = await window.ethereum.request({
         method: 'eth_requestAccounts',
       });
@@ -687,6 +707,31 @@ export default function App() {
     } catch (err: any) {
       setErrorMsg(err?.message || 'Failed to connect wallet');
     }
+  }
+
+  async function disconnectWallet() {
+    localStorage.setItem('prism_wallet_disconnected', '1');
+    setAccount(null);
+    setBalances({});
+    setShowWalletMenu(false);
+    setSuccessMsg(null);
+    setErrorMsg(null);
+
+    try {
+      await window.ethereum?.request?.({
+        method: 'wallet_revokePermissions',
+        params: [{ eth_accounts: {} }],
+      });
+    } catch {
+      // Some wallets don't implement wallet_revokePermissions; local state is already cleared
+    }
+  }
+
+  function handleCopyAddress() {
+    if (!account) return;
+    navigator.clipboard?.writeText(account);
+    setCopiedAddr(true);
+    setTimeout(() => setCopiedAddr(false), 1800);
   }
 
   async function switchToGiwaSepolia() {
@@ -1078,16 +1123,55 @@ export default function App() {
               Wrong Network
             </button>
           ) : (
-            <div style={styles.accountBadge}>
-              <span style={styles.accountBal}>
-                {Number(
-                  formatUnits(balances[AMMORA_NATIVE_TOKEN.toLowerCase()] ?? 0n, 18)
-                ).toFixed(4)}{' '}
-                ETH
-              </span>
-              <span style={styles.accountAddr}>
-                {account.slice(0, 6)}...{account.slice(-4)}
-              </span>
+            <div style={styles.walletMenuWrap} ref={walletMenuRef}>
+              <button
+                style={styles.accountBadgeBtn}
+                onClick={() => setShowWalletMenu((prev) => !prev)}
+                title="Wallet options"
+              >
+                <span style={styles.accountBal}>
+                  {Number(
+                    formatUnits(balances[AMMORA_NATIVE_TOKEN.toLowerCase()] ?? 0n, 18)
+                  ).toFixed(4)}{' '}
+                  ETH
+                </span>
+                <span style={styles.accountAddr}>
+                  {account.slice(0, 6)}...{account.slice(-4)} ▾
+                </span>
+              </button>
+
+              {showWalletMenu && (
+                <div style={styles.walletDropdown}>
+                  <button
+                    style={styles.walletMenuItem}
+                    onClick={handleCopyAddress}
+                  >
+                    <span>{copiedAddr ? 'Copied!' : 'Copy Address'}</span>
+                    <span style={styles.menuSubIcon}>{copiedAddr ? '✓' : '⧉'}</span>
+                  </button>
+
+                  <a
+                    href={`${GIWA_CHAIN.blockExplorers.default.url}/address/${account}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    style={styles.walletMenuLink}
+                    onClick={() => setShowWalletMenu(false)}
+                  >
+                    <span>View on Explorer</span>
+                    <span style={styles.menuSubIcon}>↗</span>
+                  </a>
+
+                  <div style={styles.menuDivider} />
+
+                  <button
+                    style={styles.disconnectBtn}
+                    onClick={disconnectWallet}
+                  >
+                    <span>Disconnect</span>
+                    <span>⏻</span>
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -1488,7 +1572,7 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: 'center',
     justifyContent: 'space-between',
     position: 'relative',
-    zIndex: 2,
+    zIndex: 10,
   },
   brand: {
     display: 'flex',
@@ -1559,7 +1643,10 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 700,
     cursor: 'pointer',
   },
-  accountBadge: {
+  walletMenuWrap: {
+    position: 'relative',
+  },
+  accountBadgeBtn: {
     display: 'flex',
     alignItems: 'center',
     background: '#141720',
@@ -1567,6 +1654,7 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 12,
     padding: '4px',
     fontSize: 13,
+    cursor: 'pointer',
   },
   accountBal: {
     padding: '4px 10px',
@@ -1579,6 +1667,70 @@ const styles: Record<string, React.CSSProperties> = {
     padding: '5px 10px',
     borderRadius: 9,
     fontWeight: 600,
+  },
+  walletDropdown: {
+    position: 'absolute',
+    top: 'calc(100% + 8px)',
+    right: 0,
+    width: 210,
+    background: '#161a24',
+    border: '1px solid #262b3b',
+    borderRadius: 14,
+    padding: 6,
+    boxShadow: '0 16px 40px rgba(0, 0, 0, 0.6)',
+    zIndex: 30,
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 2,
+  },
+  walletMenuItem: {
+    width: '100%',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    background: 'transparent',
+    border: 'none',
+    borderRadius: 10,
+    padding: '9px 12px',
+    color: '#e2e8f0',
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: 'pointer',
+  },
+  walletMenuLink: {
+    width: '100%',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderRadius: 10,
+    padding: '9px 12px',
+    color: '#e2e8f0',
+    fontSize: 13,
+    fontWeight: 600,
+    textDecoration: 'none',
+  },
+  menuSubIcon: {
+    color: '#94a3b8',
+    fontSize: 12,
+  },
+  menuDivider: {
+    height: 1,
+    background: '#232838',
+    margin: '4px 6px',
+  },
+  disconnectBtn: {
+    width: '100%',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    background: 'rgba(244, 63, 94, 0.1)',
+    border: 'none',
+    borderRadius: 10,
+    padding: '9px 12px',
+    color: '#fda4af',
+    fontSize: 13,
+    fontWeight: 700,
+    cursor: 'pointer',
   },
   main: {
     flex: 1,
