@@ -51,6 +51,7 @@ const TAMM_ADDRESS = '0x10B3Cc2fc981277Ada576891CF649D0ABA768B06' as Address;
 const TAMM_V3_POOL = '0x1EF92A6a9BB4bBed2b385Dd5E688F88e7965BCf8' as Address;
 const AMMORA_V3_NATIVE_ROUTER = '0x4fc91b90087288520a7bb4aa7ab5441bb4e9c496' as Address;
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000' as Address;
+const QUOTE_SIM_ACCOUNT = '0x000000000000000000000000000000000000dEaD' as Address;
 
 const WETH_ADDRESS = giwaSepoliaAutoRouteDeployment.contracts.tokens
   .wrappedNative as Address;
@@ -183,7 +184,7 @@ export default function App() {
     []
   );
 
-  // Загрузка живой ленты последних сделок из пула tAMM
+  // Load recent swaps from the tAMM pool
   const loadRecentSwaps = useCallback(async () => {
     setIsLoadingFeed(true);
     try {
@@ -220,7 +221,7 @@ export default function App() {
       }
       setRecentSwaps(items);
     } catch {
-      // не прерываем работу UI при таймауте RPC
+      // ignore transient RPC errors
     } finally {
       setIsLoadingFeed(false);
     }
@@ -398,6 +399,45 @@ export default function App() {
     };
   }, [publicClient]);
 
+  // Quote simulation helper with virtual ETH balance override so quotes work for all visitors
+  const simulateNativeBuyQuote = useCallback(
+    async (ethAmountRaw: bigint, deadline: bigint) => {
+      const simAccount = account ?? QUOTE_SIM_ACCOUNT;
+      const virtualBalance = ethAmountRaw + parseUnits('10', 18);
+
+      try {
+        const sim = await publicClient.simulateContract({
+          address: AMMORA_V3_NATIVE_ROUTER,
+          abi: ammoraV3NativeRouterAbi,
+          functionName: 'swapPoolExactInNative',
+          args: [TAMM_V3_POOL, 1n, simAccount, deadline, ZERO_ADDRESS],
+          value: ethAmountRaw,
+          account: simAccount,
+          stateOverride: [
+            {
+              address: simAccount,
+              balance: virtualBalance,
+            },
+          ],
+        });
+        return BigInt((sim.result as any) ?? 0n);
+      } catch {
+        // Fallback without stateOverride if RPC restricts overrides
+        const sim = await publicClient.simulateContract({
+          address: AMMORA_V3_NATIVE_ROUTER,
+          abi: ammoraV3NativeRouterAbi,
+          functionName: 'swapPoolExactInNative',
+          args: [TAMM_V3_POOL, 1n, simAccount, deadline, ZERO_ADDRESS],
+          value: ethAmountRaw,
+          account: simAccount,
+        });
+        return BigInt((sim.result as any) ?? 0n);
+      }
+    },
+    [account, publicClient]
+  );
+
+  // Auto-quote for any pair (ETH, WETH, tAMM, custom ERC-20)
   useEffect(() => {
     let cancelled = false;
     const numericIn = Number(amountIn);
@@ -426,6 +466,7 @@ export default function App() {
     const inIsTamm = isSameAddr(tokenIn.address, TAMM_ADDRESS);
     const outIsTamm = isSameAddr(tokenOut.address, TAMM_ADDRESS);
 
+    // 1. ETH <-> WETH (1:1)
     if ((inIsEth && outIsWeth) || (inIsWeth && outIsEth)) {
       const raw = parseUnits(amountIn, 18);
       setLastQuote({ mode: 'weth', expectedOut: raw, minOut: raw });
@@ -443,19 +484,12 @@ export default function App() {
 
       try {
         const amountInRaw = parseUnits(amountIn, tokenIn.decimals);
-        const recipient = account ?? '0xFAEf8B2614223F4f333f83496f1E399557f973bf';
+        const recipient = account ?? QUOTE_SIM_ACCOUNT;
         const deadline = BigInt(Math.floor(Date.now() / 1000) + 1800);
 
+        // 2. Buy tAMM (with ETH or WETH)
         if ((inIsEth || inIsWeth) && outIsTamm) {
-          const sim = await publicClient.simulateContract({
-            address: AMMORA_V3_NATIVE_ROUTER,
-            abi: ammoraV3NativeRouterAbi,
-            functionName: 'swapPoolExactInNative',
-            args: [TAMM_V3_POOL, 1n, recipient, deadline, ZERO_ADDRESS],
-            value: amountInRaw,
-            account: recipient,
-          });
-          const expectedOut = BigInt((sim.result as any) ?? 0n);
+          const expectedOut = await simulateNativeBuyQuote(amountInRaw, deadline);
           const minOut =
             expectedOut > 0n
               ? (expectedOut * BigInt(10000 - slippageBps)) / 10000n
@@ -488,6 +522,7 @@ export default function App() {
           return;
         }
 
+        // 3. Sell tAMM (for ETH or WETH)
         if (inIsTamm && (outIsEth || outIsWeth)) {
           let expectedOut = 0n;
           const userTammBal = account ? balances[TAMM_ADDRESS.toLowerCase()] ?? 0n : 0n;
@@ -522,15 +557,7 @@ export default function App() {
 
           if (expectedOut === 0n) {
             const probeEth = parseUnits('0.001', 18);
-            const probeSim = await publicClient.simulateContract({
-              address: AMMORA_V3_NATIVE_ROUTER,
-              abi: ammoraV3NativeRouterAbi,
-              functionName: 'swapPoolExactInNative',
-              args: [TAMM_V3_POOL, 1n, recipient, deadline, ZERO_ADDRESS],
-              value: probeEth,
-              account: recipient,
-            });
-            const probeTammOut = BigInt((probeSim.result as any) ?? 1n);
+            const probeTammOut = await simulateNativeBuyQuote(probeEth, deadline);
             expectedOut =
               probeTammOut > 0n ? (amountInRaw * probeEth) / probeTammOut : 1n;
           }
@@ -567,6 +594,7 @@ export default function App() {
           return;
         }
 
+        // 4. Other tokens via AmmoraRouteClient
         const head = await publicClient.getBlockNumber();
         const routes = await AmmoraRouteClient.create({
           client: publicClient as any,
@@ -614,7 +642,7 @@ export default function App() {
           setQuoteOutDisplay('');
           setRateDisplay(null);
           setRouteLabel(null);
-          setErrorMsg(err?.shortMessage || 'Маршрут для этой пары не найден');
+          setErrorMsg(err?.shortMessage || 'No route available for this pair');
         }
       } finally {
         if (!cancelled) setIsQuoting(false);
@@ -634,11 +662,12 @@ export default function App() {
     balances,
     publicClient,
     discoveredPools,
+    simulateNativeBuyQuote,
   ]);
 
   async function connectWallet() {
     if (!window.ethereum) {
-      setErrorMsg('Установите MetaMask или Rabby Wallet');
+      setErrorMsg('Please install MetaMask or Rabby Wallet');
       return;
     }
     try {
@@ -656,7 +685,7 @@ export default function App() {
         await switchToGiwaSepolia();
       }
     } catch (err: any) {
-      setErrorMsg(err?.message || 'Ошибка подключения кошелька');
+      setErrorMsg(err?.message || 'Failed to connect wallet');
     }
   }
 
@@ -686,7 +715,7 @@ export default function App() {
         });
         setChainId(GIWA_CHAIN.id);
       } else {
-        setErrorMsg('Не удалось переключить сеть на GIWA Sepolia');
+        setErrorMsg('Could not switch network to GIWA Sepolia');
       }
     }
   }
@@ -740,7 +769,7 @@ export default function App() {
       );
       handleSelectToken(imported);
     } catch {
-      setErrorMsg('Контракт по этому адресу не является стандартным ERC-20');
+      setErrorMsg('Address is not a valid ERC-20 token contract');
     } finally {
       setIsImportingToken(false);
     }
@@ -799,7 +828,7 @@ export default function App() {
 
       if (lastQuote.mode === 'weth') {
         const isWrap = Boolean(tokenIn.isNative);
-        setSwapStepText(isWrap ? 'Оборачиваем ETH в WETH...' : 'Разворачиваем WETH в ETH...');
+        setSwapStepText(isWrap ? 'Wrapping ETH into WETH...' : 'Unwrapping WETH to ETH...');
         const hash = isWrap
           ? await walletClient.writeContract({
               address: WETH_ADDRESS,
@@ -815,13 +844,13 @@ export default function App() {
             });
         setTxHash(hash);
         await publicClient.waitForTransactionReceipt({ hash });
-        setSuccessMsg(`Обмен ${amountIn} ${tokenIn.symbol} → ${tokenOut.symbol} выполнен`);
+        setSuccessMsg(`Swapped ${amountIn} ${tokenIn.symbol} → ${tokenOut.symbol}`);
         await refreshBalances();
         return;
       }
 
       if (lastQuote.mode === 'eth-to-tamm') {
-        setSwapStepText('Подтвердите обмен ETH → tAMM в кошельке...');
+        setSwapStepText('Confirm ETH → tAMM swap in wallet...');
         const hash = await walletClient.writeContract({
           address: AMMORA_V3_NATIVE_ROUTER,
           abi: ammoraV3NativeRouterAbi,
@@ -837,13 +866,13 @@ export default function App() {
         });
         setTxHash(hash);
         await publicClient.waitForTransactionReceipt({ hash });
-        setSuccessMsg(`Получено ~${quoteOutDisplay} tAMM за ${amountIn} ETH`);
+        setSuccessMsg(`Received ~${quoteOutDisplay} tAMM for ${amountIn} ETH`);
         await Promise.all([refreshBalances(), loadRecentSwaps()]);
         return;
       }
 
       if (lastQuote.mode === 'weth-to-tamm') {
-        setSwapStepText('Шаг 1/2: Разворачиваем WETH в ETH...');
+        setSwapStepText('Step 1/2: Unwrapping WETH to ETH...');
         const unwrapHash = await walletClient.writeContract({
           address: WETH_ADDRESS,
           abi: WETH_ABI,
@@ -852,7 +881,7 @@ export default function App() {
         });
         await publicClient.waitForTransactionReceipt({ hash: unwrapHash });
 
-        setSwapStepText('Шаг 2/2: Покупаем tAMM за ETH...');
+        setSwapStepText('Step 2/2: Swapping ETH for tAMM...');
         const swapHash = await walletClient.writeContract({
           address: AMMORA_V3_NATIVE_ROUTER,
           abi: ammoraV3NativeRouterAbi,
@@ -868,7 +897,7 @@ export default function App() {
         });
         setTxHash(swapHash);
         await publicClient.waitForTransactionReceipt({ hash: swapHash });
-        setSuccessMsg(`Получено ~${quoteOutDisplay} tAMM за ${amountIn} WETH`);
+        setSuccessMsg(`Received ~${quoteOutDisplay} tAMM for ${amountIn} WETH`);
         await Promise.all([refreshBalances(), loadRecentSwaps()]);
         return;
       }
@@ -883,7 +912,7 @@ export default function App() {
         });
 
         if (allow < rawAmount) {
-          setSwapStepText('Одобряем доступ к tAMM (Approve)...');
+          setSwapStepText('Approving tAMM spend...');
           const approveHash = await walletClient.writeContract({
             address: TAMM_ADDRESS,
             abi: erc20Abi,
@@ -898,7 +927,7 @@ export default function App() {
           : 0n;
 
         setSwapStepText(
-          isToWeth ? 'Шаг 1/2: Обмениваем tAMM → ETH...' : 'Обмениваем tAMM → ETH...'
+          isToWeth ? 'Step 1/2: Swapping tAMM → ETH...' : 'Swapping tAMM → ETH...'
         );
         const swapHash = await walletClient.writeContract({
           address: AMMORA_V3_NATIVE_ROUTER,
@@ -922,7 +951,7 @@ export default function App() {
           const receivedEth =
             ethAfter > ethBefore ? ethAfter - ethBefore : lastQuote.expectedOut;
           if (receivedEth > 0n) {
-            setSwapStepText('Шаг 2/2: Оборачиваем полученный ETH в WETH...');
+            setSwapStepText('Step 2/2: Wrapping ETH into WETH...');
             const wrapHash = await walletClient.writeContract({
               address: WETH_ADDRESS,
               abi: WETH_ABI,
@@ -935,13 +964,13 @@ export default function App() {
         }
 
         setSuccessMsg(
-          `Продано ${amountIn} tAMM за ~${quoteOutDisplay} ${tokenOut.symbol}`
+          `Sold ${amountIn} tAMM for ~${quoteOutDisplay} ${tokenOut.symbol}`
         );
         await Promise.all([refreshBalances(), loadRecentSwaps()]);
         return;
       }
 
-      setSwapStepText('Выполнение обмена через Ammora AutoRoute...');
+      setSwapStepText('Executing swap via Ammora AutoRoute...');
       const head = await publicClient.getBlockNumber();
       const routes = await AmmoraRouteClient.create({
         client: publicClient as any,
@@ -969,10 +998,10 @@ export default function App() {
         (receipt as any)?.transactionHash ||
         (typeof receipt === 'string' ? receipt : null);
       if (hash) setTxHash(hash);
-      setSuccessMsg(`Обмен ${amountIn} ${tokenIn.symbol} → ${tokenOut.symbol} выполнен`);
+      setSuccessMsg(`Swapped ${amountIn} ${tokenIn.symbol} → ${tokenOut.symbol}`);
       await Promise.all([refreshBalances(), loadRecentSwaps()]);
     } catch (err: any) {
-      setErrorMsg(err?.shortMessage || err?.message || 'Транзакция отменена');
+      setErrorMsg(err?.shortMessage || err?.message || 'Transaction rejected');
     } finally {
       setIsSwapping(false);
       setSwapStepText(null);
@@ -1028,11 +1057,9 @@ export default function App() {
       <header style={styles.navbar}>
         <div style={styles.brand}>
           <PrismLogo />
-          <div>
-            <div style={styles.brandRow}>
-              <span style={styles.brandTitle}>Prism</span>
-              <span style={styles.brandTag}>Built with Ammora SDK</span>
-            </div>
+          <div style={styles.brandRow}>
+            <span style={styles.brandTitle}>Prism</span>
+            <span style={styles.brandTag}>Built with Ammora SDK</span>
           </div>
         </div>
 
@@ -1044,11 +1071,11 @@ export default function App() {
 
           {!account ? (
             <button style={styles.connectBtn} onClick={connectWallet}>
-              Подключить кошелёк
+              Connect Wallet
             </button>
           ) : chainId !== GIWA_CHAIN.id ? (
             <button style={styles.warnBtn} onClick={switchToGiwaSepolia}>
-              Неверная сеть
+              Wrong Network
             </button>
           ) : (
             <div style={styles.accountBadge}>
@@ -1071,7 +1098,7 @@ export default function App() {
         {/* Swap Card */}
         <div style={styles.card}>
           <div style={styles.cardTop}>
-            <span style={styles.cardTitle}>Обмен</span>
+            <span style={styles.cardTitle}>Swap</span>
             <button
               style={styles.settingsBtn}
               onClick={() => setShowSettings(!showSettings)}
@@ -1082,7 +1109,7 @@ export default function App() {
 
           {showSettings && (
             <div style={styles.settingsDrawer}>
-              <div style={styles.settingsLabel}>Допустимое проскальзывание</div>
+              <div style={styles.settingsLabel}>Max Slippage Tolerance</div>
               <div style={styles.slippageGrid}>
                 {[50, 100, 200, 500].map((bps) => (
                   <button
@@ -1103,9 +1130,9 @@ export default function App() {
           {/* Input Field (Sell) */}
           <div style={styles.inputCard}>
             <div style={styles.fieldMeta}>
-              <span>Вы отдаёте</span>
+              <span>You pay</span>
               <div style={styles.balanceGroup}>
-                <span>Баланс: {account ? formattedInBal : '0'}</span>
+                <span>Balance: {account ? formattedInBal : '0'}</span>
                 {account && inBalRaw > 0n && (
                   <>
                     <button
@@ -1159,7 +1186,7 @@ export default function App() {
             <button
               style={styles.flipBtn}
               onClick={handleFlipTokens}
-              title="Поменять токены местами"
+              title="Switch tokens"
             >
               ↓
             </button>
@@ -1168,8 +1195,8 @@ export default function App() {
           {/* Output Field (Buy) */}
           <div style={{ ...styles.inputCard, marginTop: -8 }}>
             <div style={styles.fieldMeta}>
-              <span>Вы получите</span>
-              <span>Баланс: {account ? formattedOutBal : '0'}</span>
+              <span>You receive</span>
+              <span>Balance: {account ? formattedOutBal : '0'}</span>
             </div>
 
             <div style={styles.fieldMain}>
@@ -1181,7 +1208,7 @@ export default function App() {
                 type="text"
                 readOnly
                 placeholder="0"
-                value={isQuoting ? 'Расчёт...' : quoteOutDisplay}
+                value={isQuoting ? 'Quoting...' : quoteOutDisplay}
               />
 
               <button
@@ -1206,12 +1233,12 @@ export default function App() {
           {rateDisplay && (
             <div style={styles.infoBox}>
               <div style={styles.infoRow}>
-                <span>Курс</span>
+                <span>Rate</span>
                 <span style={styles.infoStrong}>{rateDisplay}</span>
               </div>
               {routeLabel && (
                 <div style={styles.infoRow}>
-                  <span>Маршрут</span>
+                  <span>Route</span>
                   <span style={styles.infoStrong}>{routeLabel}</span>
                 </div>
               )}
@@ -1230,18 +1257,18 @@ export default function App() {
             disabled={insufficientBalance || isSwapping || isQuoting || !amountIn}
           >
             {!account
-              ? 'Подключить кошелёк'
+              ? 'Connect Wallet'
               : chainId !== GIWA_CHAIN.id
-              ? 'Переключить сеть на GIWA Sepolia'
+              ? 'Switch to GIWA Sepolia'
               : !amountIn || Number(amountIn) <= 0
-              ? 'Введите сумму'
+              ? 'Enter an amount'
               : insufficientBalance
-              ? `Недостаточно ${tokenIn.symbol}`
+              ? `Insufficient ${tokenIn.symbol} balance`
               : isSwapping
-              ? swapStepText || 'Подтвердите в кошельке...'
+              ? swapStepText || 'Confirm in wallet...'
               : isQuoting
-              ? 'Получение курса...'
-              : `Обменять ${tokenIn.symbol} на ${tokenOut.symbol}`}
+              ? 'Fetching quote...'
+              : `Swap ${tokenIn.symbol} for ${tokenOut.symbol}`}
           </button>
 
           {errorMsg && <div style={styles.errorBox}>{errorMsg}</div>}
@@ -1256,7 +1283,7 @@ export default function App() {
                   rel="noreferrer"
                   style={styles.explorerLink}
                 >
-                  Открыть в GIWA Explorer ↗
+                  View on GIWA Explorer ↗
                 </a>
               )}
             </div>
@@ -1268,13 +1295,13 @@ export default function App() {
           <div style={styles.feedHeader}>
             <div style={styles.feedTitleWrap}>
               <span style={styles.livePulse} />
-              <span style={styles.feedTitle}>Последние сделки в пуле tAMM</span>
+              <span style={styles.feedTitle}>Recent Pool Swaps (tAMM)</span>
             </div>
             <button
               style={styles.refreshBtn}
               onClick={loadRecentSwaps}
               disabled={isLoadingFeed}
-              title="Обновить ленту из блокчейна"
+              title="Refresh on-chain activity"
             >
               {isLoadingFeed ? '...' : '↻'}
             </button>
@@ -1283,8 +1310,8 @@ export default function App() {
           {recentSwaps.length === 0 ? (
             <div style={styles.feedEmpty}>
               {isLoadingFeed
-                ? 'Загрузка событий пула из GIWA Sepolia...'
-                : 'За последние 1500 блоков новых свопов не найдено'}
+                ? 'Loading pool events from GIWA Sepolia...'
+                : 'No recent swaps in the last 1,500 blocks'}
             </div>
           ) : (
             <div style={styles.feedList}>
@@ -1305,7 +1332,7 @@ export default function App() {
                           : styles.sideSell),
                       }}
                     >
-                      {item.type === 'BUY' ? 'BUY' : 'SELL'}
+                      {item.type}
                     </span>
                     <span style={styles.feedAmount}>{item.tammAmount} tAMM</span>
                   </div>
@@ -1334,7 +1361,7 @@ export default function App() {
             onClick={(e) => e.stopPropagation()}
           >
             <div style={styles.modalHeader}>
-              <span style={styles.modalTitle}>Выберите токен</span>
+              <span style={styles.modalTitle}>Select a token</span>
               <button
                 style={styles.closeBtn}
                 onClick={() => setSelectorSide(null)}
@@ -1345,7 +1372,7 @@ export default function App() {
 
             <input
               style={styles.searchInput}
-              placeholder="Поиск по названию или адресу (0x...)"
+              placeholder="Search by name or paste address (0x...)"
               value={tokenSearch}
               onChange={(e) => setTokenSearch(e.target.value)}
               autoFocus
@@ -1415,13 +1442,13 @@ export default function App() {
                   disabled={isImportingToken}
                 >
                   {isImportingToken
-                    ? 'Загрузка токена...'
-                    : `Импортировать токен ${tokenSearch.slice(0, 6)}...${tokenSearch.slice(-4)}`}
+                    ? 'Loading token...'
+                    : `Import token ${tokenSearch.slice(0, 6)}...${tokenSearch.slice(-4)}`}
                 </button>
               )}
 
               {filteredTokens.length === 0 && !isAddress(tokenSearch.trim()) && (
-                <div style={styles.emptySearch}>Токены не найдены</div>
+                <div style={styles.emptySearch}>No tokens found</div>
               )}
             </div>
           </div>
